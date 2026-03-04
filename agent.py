@@ -5,40 +5,40 @@ import sys
 from datetime import timedelta
 
 from dotenv import load_dotenv
-from openai import AsyncOpenAI
+from anthropic import AsyncAnthropic
 from opensandbox import Sandbox
 from opensandbox.config import ConnectionConfig
 
 load_dotenv()
 
-# We will use the standard openai sdk to support ANY openai compatible endpoint
-# (e.g., local vllm, qwen, deepseek, or openai)
-client = AsyncOpenAI(
-    api_key=os.environ.get("ANTHROPIC_API_KEY", "sk-api-W_DQfkTlXiMgb5tHQKVCpYEaq9KcaR7v86pzN6ojvy9tsyqGmwdkjQ1LS2Oxd_KfbASq-p-OxnjeeysT5GMFBEn0xGzEb33JRIPfEUhScIMXGlx0UDe6a9g"),
+# We use the anthropic SDK to support Minimax's Anthropic-compatible endpoint
+api_key = os.environ.get("ANTHROPIC_API_KEY", "dummy-key")
+client = AsyncAnthropic(
+    api_key=api_key,
     base_url=os.environ.get("ANTHROPIC_BASE_URL", "https://api.minimax.io/anthropic"),
+    default_headers={"Authorization": f"Bearer {api_key}"}
 )
-MODEL_NAME = os.environ.get("LLM_MODEL", "gpt-4o-mini")
+MODEL_NAME = os.environ.get("LLM_MODEL", "MiniMax-M2.1")
 
-# The unified tool schema for OpenAI tool calling
+# The unified tool schema for Anthropic tool calling
 TOOLS = [
     {
-        "type": "function",
-        "function": {
-            "name": "run_code_in_sandbox",
-            "description": "Executes bash or python commands inside a secure sandbox container and returns the standard output/error.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "command": {
-                        "type": "string",
-                        "description": "The command line string to execute, for example 'python3 -c \"print(1+1)\"' or 'ls -l'."
-                    }
-                },
-                "required": ["command"]
-            }
+        "name": "run_code_in_sandbox",
+        "description": "Executes bash or python commands inside a secure sandbox container and returns the standard output/error.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "description": "The command line string to execute, for example 'python3 -c \"print(1+1)\"' or 'ls -l'."
+                }
+            },
+            "required": ["command"]
         }
     }
 ]
+
+SYSTEM_PROMPT = "You are a helpful AI assistant that has access to a secure bash terminal sandbox. You can use the 'run_code_in_sandbox' tool to execute any code, read files, debug, and perform actions. You should write files directly, run them, explore the environment, and answer the user's questions based on the sandbox execution results."
 
 async def _print_execution_logs(execution) -> str:
     """Helper to collect and return the execution logs as a string."""
@@ -59,11 +59,10 @@ async def _print_execution_logs(execution) -> str:
     res = "\n".join(outputs).strip()
     return res if res else "(command executed successfully with no output)"
 
-async def handle_tool_call(tool_call, sandbox: Sandbox) -> str:
+async def handle_tool_call(tool_use_block, sandbox: Sandbox) -> str:
     """Execute a specific tool call coming from the LLM"""
-    if tool_call.function.name == "run_code_in_sandbox":
-        args = json.loads(tool_call.function.arguments)
-        command = args["command"]
+    if tool_use_block.name == "run_code_in_sandbox":
+        command = tool_use_block.input["command"]
         print(f"\n[Agent Tool Calling] Executing: {command}\n")
         
         # Run command in sandbox
@@ -73,7 +72,7 @@ async def handle_tool_call(tool_call, sandbox: Sandbox) -> str:
         result = await _print_execution_logs(execution)
         return result
     else:
-        return f"Error: Unknown tool {tool_call.function.name}"
+        return f"Error: Unknown tool {tool_use_block.name}"
 
 async def main():
     print("Setting up OpenSandbox...")
@@ -103,9 +102,7 @@ async def main():
         return
 
     # Initialize Memory
-    messages = [
-        {"role": "system", "content": "You are a helpful AI assistant that has access to a secure bash terminal sandbox. You can use the 'run_code_in_sandbox' tool to execute any code, read files, debug, and perform actions. You should write files directly, run them, explore the environment, and answer the user's questions based on the sandbox execution results."}
-    ]
+    messages = []
 
     print("\n--- Agent Ready! Type 'exit' or 'quit' to terminate. ---")
     
@@ -123,39 +120,51 @@ async def main():
 
                 while True:
                     # Request LLM response
-                    response = await client.chat.completions.create(
+                    response = await client.messages.create(
                         model=MODEL_NAME,
+                        system=SYSTEM_PROMPT,
                         messages=messages,
                         tools=TOOLS,
-                        tool_choice="auto"
+                        max_tokens=4096,
                     )
                     
-                    response_message = response.choices[0].message
-                    # For openai > 1.0.0 we append the message dict representation or the object
-                    messages.append(response_message)
+                    # Add assistant reply to memory
+                    messages.append({"role": "assistant", "content": response.content})
 
-                    if response_message.tool_calls:
+                    if response.stop_reason == "tool_use":
                         # LLM wants to call a tool
-                        for tool_call in response_message.tool_calls:
-                            tool_result = await handle_tool_call(tool_call, sandbox)
+                        tool_uses = [block for block in response.content if block.type == "tool_use"]
+                        
+                        tool_results = []
+                        for tool_use in tool_uses:
+                            tool_result_str = await handle_tool_call(tool_use, sandbox)
                             
-                            # Append the tool result back to internal memory
-                            messages.append({
-                                "role": "tool",
-                                "tool_call_id": tool_call.id,
-                                "name": tool_call.function.name,
-                                "content": str(tool_result),
+                            # Anthropic tool results are passed in as "content" inside a user message
+                            tool_results.append({
+                                "type": "tool_result",
+                                "tool_use_id": tool_use.id,
+                                "content": str(tool_result_str),
                             })
+                            
+                        # Append the tool result back to internal memory as a user message
+                        messages.append({
+                            "role": "user",
+                            "content": tool_results,
+                        })
                         
                         # Loop back up to let LLM generate a new message observing the tool output
                     else:
                         # LLM gave a text answer
-                        print(f"\nAssistant: {response_message.content}")
+                        text_blocks = [block.text for block in response.content if block.type == "text"]
+                        reply = "\n".join(text_blocks)
+                        print(f"\nAssistant: {reply}")
                         break # Break inner loop, wait for next user input
                         
             except KeyboardInterrupt:
                 break
             except Exception as e:
+                import traceback
+                traceback.print_exc()
                 print(f"\nAn error occurred: {e}")
                 
         # Cleanup
