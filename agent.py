@@ -20,27 +20,87 @@ client = AsyncAnthropic(
     base_url=os.environ.get("ANTHROPIC_BASE_URL", "https://api.minimax.io/anthropic"),
     default_headers={"Authorization": f"Bearer {api_key}"}
 )
-MODEL_NAME = os.environ.get("LLM_MODEL", "MiniMax-M2.1")
+MODEL_NAME = os.environ.get("LLM_MODEL", "MiniMax-M2.5")
 
 # The unified tool schema for Anthropic tool calling
 TOOLS = [
     {
-        "name": "run_code_in_sandbox",
-        "description": "Executes bash or python commands inside a secure sandbox container and returns the standard output/error.",
+        "name": "sandbox_no_side_effects",
+        "description": "[SAFE TO SKIP] Executes a bash command that has absolutely NO side effects (e.g., cat, ls, find). During system recovery (Replay), this won't be executed again; cached results will be used.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "command": {
                     "type": "string",
-                    "description": "The command line string to execute, for example 'python3 -c \"print(1+1)\"' or 'ls -l'."
+                    "description": "The command line string to execute."
                 }
             },
             "required": ["command"]
         }
+    },
+    {
+        "name": "sandbox_action_replayable",
+        "description": "[SAFE TO REPLAY] Executes a bash command that modifies the sandbox state but can be safely re-executed (e.g., writing files, apt-get install, mkdir). During system recovery (Replay), this WILL be re-executed to rebuild the environment.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "description": "The command line string to execute."
+                }
+            },
+            "required": ["command"]
+        }
+    },
+    {
+        "name": "sandbox_action_irreversible",
+        "description": "[NEVER REPLAY] Executes a bash command that interacts with external APIs or performs irreversible real-world actions (e.g., curl POST, dropping a DB). During system recovery (Replay), this is STRICTLY BLOCKED from executing twice; cached results will be used.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "description": "The command line string to execute."
+                }
+            },
+            "required": ["command"]
+        }
+    },
+    {
+        "name": "gateway_fetch_url",
+        "description": "Performs an HTTP request from the host gateway (bypassing sandbox restrictions). Used for accessing the internet, fetching APIs, or querying web pages.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "The full HTTP/HTTPS URL to request."
+                },
+                "method": {
+                    "type": "string",
+                    "description": "The HTTP method (e.g., GET, POST, PUT, DELETE). Default is GET.",
+                    "default": "GET"
+                },
+                "data": {
+                    "type": "string",
+                    "description": "Optional payload data for POST/PUT requests."
+                }
+            },
+            "required": ["url"]
+        }
     }
 ]
 
-SYSTEM_PROMPT = "You are a helpful AI assistant that has access to a secure bash terminal sandbox. You can use the 'run_code_in_sandbox' tool to execute any code, read files, debug, and perform actions. You should write files directly, run them, explore the environment, and answer the user's questions based on the sandbox execution results."
+SYSTEM_PROMPT = """You are a helpful AI assistant with access to a secure bash sandbox AND a host Capability Gateway. 
+
+CRITICAL SECURITY RULES:
+1. The sandbox environment has NO external network access. DO NOT use `curl`, `wget`, or any custom python/node scripts inside the sandbox to access the internet.
+2. For all external web requests or API calls, you MUST use the `gateway_fetch_url` tool.
+3. You MUST classify sandbox actions precisely:
+   - 'sandbox_no_side_effects' for pure reads (e.g., cat, ls).
+   - 'sandbox_action_replayable' for state mutations that can be safely repeated (e.g., mkdir, writing config files).
+   - 'sandbox_action_irreversible' only when strictly unavoidable inside the sandbox.
+"""
 
 class TrajectoryLogger:
     def __init__(self, enabled: bool):
@@ -83,28 +143,60 @@ async def _print_execution_logs(execution) -> str:
 
 async def handle_tool_call(tool_use_block, sandbox: Sandbox, logger: TrajectoryLogger) -> str:
     """Execute a specific tool call coming from the LLM"""
-    if tool_use_block.name == "run_code_in_sandbox":
-        command = tool_use_block.input["command"]
-        print(f"\n[Agent Tool Calling] Executing: {command}\n")
-        
-        start_time = time.time()
-        # Run command in sandbox
-        execution = await sandbox.commands.run(command)
-        
-        # Fetch the outputs
+    tool_name = tool_use_block.name
+    
+    start_time = time.time()
+    
+    if tool_name in ["sandbox_no_side_effects", "sandbox_action_replayable", "sandbox_action_irreversible"]:
+        effect_type = tool_name.replace("sandbox_", "")
+        command_executed = tool_use_block.input["command"]
+        print(f"\n[Agent Tool Calling] ({effect_type}) Executing: {command_executed[:80]}...\n")
+        execution = await sandbox.commands.run(command_executed)
         result = await _print_execution_logs(execution)
-        end_time = time.time()
         
-        logger.log_event("tool_execution", {
-            "tool_use_id": tool_use_block.id,
-            "tool_name": tool_use_block.name,
-            "command": command,
-            "execution_time_sec": round(end_time - start_time, 3),
-            "result": result
-        })
-        return result
+    elif tool_name == "gateway_fetch_url":
+        import urllib.request
+        import urllib.error
+        url = tool_use_block.input["url"]
+        method = tool_use_block.input.get("method", "GET").upper()
+        data = tool_use_block.input.get("data", None)
+        
+        # As per strict isolation requirements, ALL external gateway requests (even GET) 
+        # are considered irreversible side effects that must be faked during Replay 
+        # to prevent drift or hitting external targets again.
+        effect_type = "action_irreversible"
+        command_executed = f"Gateway {method} {url}"
+        print(f"\n[Gateway Intercept] ({effect_type}) Fetching URL: {url}\n")
+        
+        try:
+            req_data = data.encode('utf-8') if data else None
+            req = urllib.request.Request(url, data=req_data, method=method)
+            # Add a generic user agent to avoid basic blocks
+            req.add_header('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)')
+            with urllib.request.urlopen(req, timeout=15) as response:
+                html = response.read().decode('utf-8')
+                result = f"Status: {response.status}\n\n{html[:4000]}" # truncate to avoid blowing up context
+                if len(html) > 4000:
+                    result += "\n...[Content Truncated]..."
+        except urllib.error.URLError as e:
+            result = f"Gateway HTTP Error: {str(e)}"
+        except Exception as e:
+            result = f"Gateway System Error: {str(e)}"
+            
     else:
-        return f"Error: Unknown tool {tool_use_block.name}"
+        return f"Error: Unknown tool {tool_name}"
+
+    end_time = time.time()
+    
+    logger.log_event("tool_execution", {
+        "tool_use_id": tool_use_block.id,
+        "tool_name": tool_name,
+        "effect_type": effect_type,
+        "command": command_executed,
+        "execution_time_sec": round(end_time - start_time, 3),
+        "result": result
+    })
+    return result
 
 async def replay_trajectory(filepath: str, sandbox: Sandbox, max_steps: int = None) -> list:
     """Read a JSONL trajectory, reconstruct LLM memory, and replay environment commands."""
@@ -143,11 +235,33 @@ async def replay_trajectory(filepath: str, sandbox: Sandbox, max_steps: int = No
             messages.append({"role": "assistant", "content": data.get("content", [])})
             
         elif event_type == "tool_execution":
-            print(f"[Replayer] FAST-FORWARD step {idx}: executing '{data.get('tool_name')}' -> {data.get('command')[:50]}...")
-            if data.get("tool_name") == "run_code_in_sandbox":
-                # Execute in the real environment to restore state
-                await sandbox.commands.run(data.get("command", ""))
-                replayed_cmds += 1
+            tool_name = data.get("tool_name", "sandbox_action_irreversible")
+            effect_type = data.get("effect_type", "action_irreversible")
+            cmd = data.get("command", "")
+            
+            # Legacy traces translation
+            if tool_name in ["run_code_in_sandbox", "run_command_in_sandbox", "write_file_in_sandbox"]:
+                tool_name = "sandbox_action_replayable"
+                effect_type = "action_replayable"
+            elif tool_name == "read_file_in_sandbox":
+                tool_name = "sandbox_no_side_effects"
+                effect_type = "no_side_effects"
+                
+            print(f"[Replayer] FAST-FORWARD step {idx} ({effect_type}): '{tool_name}' -> {cmd[:60]}...")
+            
+            if effect_type == "no_side_effects":
+                print(f"  -> [Skipped Sandbox/Gateway Execution] Pure read. Providing cached result directly.")
+            elif effect_type == "action_irreversible":
+                print(f"  -> [Skipped Sandbox/Gateway Execution] DANGER: Irreversible action. Providing cached fake result to resume securely.")
+            else:
+                # action_replayable
+                # We specifically only want to replay sandbox container state
+                if tool_name != "gateway_fetch_url":
+                    # Execute in the real environment to restore state
+                    await sandbox.commands.run(cmd)
+                    replayed_cmds += 1
+                else:
+                    print(f"  -> [Skipped Gateway Execution] Gateway actions cannot reconstruct sandbox state.")
                 
             current_tool_results.append({
                 "type": "tool_result",
@@ -283,7 +397,7 @@ async def main():
                         print(f"\nAssistant: {reply}")
                         break # Break inner loop, wait for next user input
                         
-            except KeyboardInterrupt:
+            except (KeyboardInterrupt, EOFError):
                 break
             except Exception as e:
                 import traceback
