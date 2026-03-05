@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import sys
+import argparse
 from datetime import timedelta, datetime
 import time
 
@@ -105,6 +106,62 @@ async def handle_tool_call(tool_use_block, sandbox: Sandbox, logger: TrajectoryL
     else:
         return f"Error: Unknown tool {tool_use_block.name}"
 
+async def replay_trajectory(filepath: str, sandbox: Sandbox, max_steps: int = None) -> list:
+    """Read a JSONL trajectory, reconstruct LLM memory, and replay environment commands."""
+    messages = []
+    current_tool_results = []
+    
+    print(f"\n[Replayer] Reconstructing state from {filepath} (Fork at step: {max_steps if max_steps is not None else 'end'})...")
+    
+    with open(filepath, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+        
+    if max_steps is not None:
+        lines = lines[:max_steps]
+        
+    replayed_cmds = 0
+    for idx, line in enumerate(lines):
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except Exception:
+            continue
+            
+        event_type = event.get("event_type")
+        data = event.get("data", {})
+        
+        # If we encounter a new user_input or llm_generation, flush any pending tool_results
+        if event_type in ("user_input", "llm_generation") and current_tool_results:
+            messages.append({"role": "user", "content": current_tool_results})
+            current_tool_results = []
+
+        if event_type == "user_input":
+            messages.append({"role": "user", "content": data.get("content", "")})
+            
+        elif event_type == "llm_generation":
+            messages.append({"role": "assistant", "content": data.get("content", [])})
+            
+        elif event_type == "tool_execution":
+            print(f"[Replayer] FAST-FORWARD step {idx}: executing '{data.get('tool_name')}' -> {data.get('command')[:50]}...")
+            if data.get("tool_name") == "run_code_in_sandbox":
+                # Execute in the real environment to restore state
+                await sandbox.commands.run(data.get("command", ""))
+                replayed_cmds += 1
+                
+            current_tool_results.append({
+                "type": "tool_result",
+                "tool_use_id": data.get("tool_use_id"),
+                "content": data.get("result", ""),
+            })
+
+    # Flush dangling
+    if current_tool_results:
+        messages.append({"role": "user", "content": current_tool_results})
+        
+    print(f"[Replayer] Done! Restored {len(messages)} message turns and fast-forwarded {replayed_cmds} commands.\n")
+    return messages
+
 async def main():
     print("Setting up OpenSandbox...")
     domain = os.getenv("SANDBOX_DOMAIN", "localhost:8080")
@@ -132,11 +189,25 @@ async def main():
         print(f"Failed to create OpenSandbox: {e}\nEnsure your server is running and configured correctly.")
         return
 
-    debug_mode = "--debug" in sys.argv or os.environ.get("DEBUG_MODE", "false").lower() == "true"
+    parser = argparse.ArgumentParser(description="OpenSandbox Agent with Trajectory Replay")
+    parser.add_argument("--debug", action="store_true", help="Enable trajectory logging")
+    parser.add_argument("--resume", type=str, help="Path to JSONL trajectory file to resume from")
+    parser.add_argument("--fork-at", type=int, default=None, help="JSONL line index (0-indexed) to fork at")
+    
+    # Attempt to parse known args to avoid conflicts if running via some IDE tools
+    args, _ = parser.parse_known_args()
+
+    debug_mode = args.debug or os.environ.get("DEBUG_MODE", "false").lower() == "true"
     logger = TrajectoryLogger(debug_mode)
 
     # Initialize Memory
     messages = []
+    
+    if args.resume and os.path.exists(args.resume):
+        try:
+            messages = await replay_trajectory(args.resume, sandbox, args.fork_at)
+        except Exception as e:
+            print(f"Error resuming trajectory: {e}")
 
     print("\n--- Agent Ready! Type 'exit' or 'quit' to terminate. ---")
     
