@@ -48,6 +48,12 @@ Agent 现在允许通过参数重修旧好：`python agent.py --resume logs/traj
   - 对于历史记录里的 `sandbox_action_irreversible` 以及所有触发 `gateway_fetch_url` 代理网络的事件，因存在不可控外部副作用和网络抖动带来的污染可能，Agent 同样拦截其实际执行，转而投喂旧 JSONL 输出制造“执行成功”幻象。
   - 对于包含环境破坏但安全的 `sandbox_action_replayable` 事件，Agent 采取强力的 `bash` 快进重放，迫使新的容器强行演化成断点前的物理环境状态。
 
+### 6. 灾难级自动愈合 (Auto-Recovery & Healing)
+随着系统的推进，在长时间无人值守执行中遭遇大模型网络超时、API 闪断、或是沙盒物理崩溃是非常正常的。系统内置了被称为“不死鸟循环”的外层 `run_agent_session` 护城河。
+- 当系统探测到运行时异常时，会自动销毁并回收旧容器。
+- 随后，程序自动接管并在后台开启重演逻辑：**提取导致崩溃那一刻之前的绝大部分完好记忆**（即精准丢弃最后那一条执行失败或酝酿灾难的 `llm_generation` 日志）。系统接着便会将这段裁剪好的健康历史物理移植录入到全新的时间戳 `trajectory_<new>.jsonl` 日志体系中。
+- 然后它在新开的云物理沙箱内经历飞速的快进重播（Fast-forward Time Travel）。待时间点刚好吻合之后，系统**强制触发（Auto Trigger）**大模型的进一步重思考流程，实现真正的全天候 Agent 续航闭环。
+
 ---
 
-**总结：** 这个 Agent 的本质是一个无尽的 REPL (Read-Eval-Print Loop) 循环，其中“代码逻辑的大脑”是大模型，“执行结果的双手”是 OpenSandbox。它可以自行调试错误、查看环境、重写代码，最终向用户返回人类可读的最终验证结果。
+**总结：** 这个 Agent 的本质是一个无尽的 REPL (Read-Eval-Print Loop) 循环，其中“代码逻辑的大脑”是大模型，“执行结果的双手”是 OpenSandbox。它可以自行调试错误、查看环境、重写代码，并且内置了不可思议的故障重修系统返回人类可读的最终验证结果。
