@@ -3,32 +3,7 @@
 这是一个利用大语言模型（LLM）的**工具调用 (Tool Calling)** 能力与 [OpenSandbox](https://github.com/kubernetes-sigs/agent-sandbox) 结合，在安全的隔离环境中执行任意代码或指令的智能体 (Agent)。
 
 ## 核心流程图
-
-```mermaid
-sequenceDiagram
-    participant User
-    participant Agent
-    participant LLM (MiniMax/Anthropic)
-    participant OpenSandbox
-
-    User->>Agent: 提供自然语言指令
-    loop 对话循环
-        Agent->>Agent: 将指令追加到内部记忆 (Memory)
-        Agent->>LLM (MiniMax/Anthropic): 携带记忆及工具注册表发起聊天请求
-        LLM (MiniMax/Anthropic)->>Agent: 返回决策 (文本回复 或 工具调用)
-        
-        alt 决定调用工具 (Stop Reason: tool_use)
-            Agent->>Agent: 解析工具名称（run_code_in_sandbox）和参数（command）
-            Agent->>OpenSandbox: 异步发送 command 在容器中执行
-            OpenSandbox-->>Agent: 执行完成，返回 stdout 和 stderr
-            Agent->>Agent: 将执行结果追加到内部记忆 (role: user, type: tool_result)
-            Note right of Agent: 内部循环继续，将结果反馈给大模型进行下一步决策
-        else 决定直接回复文本
-            Agent-->>User: 打印大模型的自然语言回复
-            Note right of Agent: 结束内部循环，等待用户的下一条指令
-        end
-    end
-```
+![alt text](<pics/Screenshot 2026-03-04 at 1.17.50 AM.png>)
 
 ## 核心组件解析
 
