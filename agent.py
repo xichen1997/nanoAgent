@@ -2,7 +2,8 @@ import asyncio
 import json
 import os
 import sys
-from datetime import timedelta
+from datetime import timedelta, datetime
+import time
 
 from dotenv import load_dotenv
 from anthropic import AsyncAnthropic
@@ -40,6 +41,26 @@ TOOLS = [
 
 SYSTEM_PROMPT = "You are a helpful AI assistant that has access to a secure bash terminal sandbox. You can use the 'run_code_in_sandbox' tool to execute any code, read files, debug, and perform actions. You should write files directly, run them, explore the environment, and answer the user's questions based on the sandbox execution results."
 
+class TrajectoryLogger:
+    def __init__(self, enabled: bool):
+        self.enabled = enabled
+        self.filepath = None
+        if self.enabled:
+            os.makedirs("logs", exist_ok=True)
+            self.filepath = f"logs/trajectory_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jsonl"
+            print(f"\n[*] Debug/RL Trajectory logging enabled: {self.filepath}")
+
+    def log_event(self, event_type: str, data: dict):
+        if not self.enabled:
+            return
+        event = {
+            "timestamp": datetime.now().isoformat(),
+            "event_type": event_type,
+            "data": data
+        }
+        with open(self.filepath, "a", encoding="utf-8") as f:
+            f.write(json.dumps(event, ensure_ascii=False) + "\n")
+
 async def _print_execution_logs(execution) -> str:
     """Helper to collect and return the execution logs as a string."""
     outputs = []
@@ -59,17 +80,27 @@ async def _print_execution_logs(execution) -> str:
     res = "\n".join(outputs).strip()
     return res if res else "(command executed successfully with no output)"
 
-async def handle_tool_call(tool_use_block, sandbox: Sandbox) -> str:
+async def handle_tool_call(tool_use_block, sandbox: Sandbox, logger: TrajectoryLogger) -> str:
     """Execute a specific tool call coming from the LLM"""
     if tool_use_block.name == "run_code_in_sandbox":
         command = tool_use_block.input["command"]
         print(f"\n[Agent Tool Calling] Executing: {command}\n")
         
+        start_time = time.time()
         # Run command in sandbox
         execution = await sandbox.commands.run(command)
         
         # Fetch the outputs
         result = await _print_execution_logs(execution)
+        end_time = time.time()
+        
+        logger.log_event("tool_execution", {
+            "tool_use_id": tool_use_block.id,
+            "tool_name": tool_use_block.name,
+            "command": command,
+            "execution_time_sec": round(end_time - start_time, 3),
+            "result": result
+        })
         return result
     else:
         return f"Error: Unknown tool {tool_use_block.name}"
@@ -101,6 +132,9 @@ async def main():
         print(f"Failed to create OpenSandbox: {e}\nEnsure your server is running and configured correctly.")
         return
 
+    debug_mode = "--debug" in sys.argv or os.environ.get("DEBUG_MODE", "false").lower() == "true"
+    logger = TrajectoryLogger(debug_mode)
+
     # Initialize Memory
     messages = []
 
@@ -117,9 +151,11 @@ async def main():
                 
                 # Update memory
                 messages.append({"role": "user", "content": user_msg})
+                logger.log_event("user_input", {"content": user_msg})
 
                 while True:
                     # Request LLM response
+                    start_time = time.time()
                     response = await client.messages.create(
                         model=MODEL_NAME,
                         system=SYSTEM_PROMPT,
@@ -127,9 +163,25 @@ async def main():
                         tools=TOOLS,
                         max_tokens=4096,
                     )
+                    end_time = time.time()
                     
                     # Add assistant reply to memory
                     messages.append({"role": "assistant", "content": response.content})
+
+                    blocks_dump = []
+                    for block in response.content:
+                        if block.type == "text":
+                            blocks_dump.append({"type": "text", "text": block.text})
+                        elif block.type == "tool_use":
+                            blocks_dump.append({"type": "tool_use", "id": block.id, "name": block.name, "input": block.input})
+                            
+                    logger.log_event("llm_generation", {
+                        "model": MODEL_NAME,
+                        "stop_reason": response.stop_reason,
+                        "generation_time_sec": round(end_time - start_time, 3),
+                        "content": blocks_dump,
+                        "usage": response.usage.model_dump() if hasattr(response, "usage") else None
+                    })
 
                     if response.stop_reason == "tool_use":
                         # LLM wants to call a tool
@@ -137,7 +189,7 @@ async def main():
                         
                         tool_results = []
                         for tool_use in tool_uses:
-                            tool_result_str = await handle_tool_call(tool_use, sandbox)
+                            tool_result_str = await handle_tool_call(tool_use, sandbox, logger)
                             
                             # Anthropic tool results are passed in as "content" inside a user message
                             tool_results.append({
