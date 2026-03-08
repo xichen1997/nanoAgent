@@ -6,3 +6,4 @@ logs
 *.pyd
 *.pyi
 changelogs
+sidecar_data
