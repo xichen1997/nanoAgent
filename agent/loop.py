@@ -83,7 +83,7 @@ def run(resume_session_id: str | None = None, fork_at: int | None = None):
             # ── Get user input (or auto-trigger) ─────────────────────────────
             if not auto_trigger:
                 try:
-                    user_msg = input("\nUser: ")
+                    user_msg = input("\n>>> ")
                 except (KeyboardInterrupt, EOFError):
                     break
 
@@ -128,9 +128,16 @@ def run(resume_session_id: str | None = None, fork_at: int | None = None):
 
                         result = exec_resp.get("result", "[No result]")
                         if exec_resp.get("replayed"):
-                            print(f"\n[Agent ↺] Tool '{tool_name}' replayed from cache.")
+                            print(f"\n[↺ {tool_name}] (replayed)")
                         else:
-                            print(f"\n[Agent ⚡] Tool '{tool_name}' executed. Effect: {exec_resp.get('effect')}")
+                            print(f"\n[⚡ {tool_name}] ({exec_resp.get('effect', '?')})")
+                        # Show output to user (truncate if long)
+                        lines = str(result).splitlines()
+                        if len(lines) <= 20:
+                            print(result)
+                        else:
+                            print("\n".join(lines[:20]))
+                            print(f"... [{len(lines) - 20} more lines]")
                         sys.stdout.flush()
 
                         tool_results.append({
@@ -151,15 +158,25 @@ def run(resume_session_id: str | None = None, fork_at: int | None = None):
                     break
 
     finally:
-        sidecar_post("/session/end", {"session_id": session_id})
+        try:
+            sidecar_post("/session/end", {"session_id": session_id})
+        except Exception:
+            pass  # Sidecar may already be gone (e.g. Ctrl+C)
 
     return session_id
 
 
-if __name__ == "__main__":
+def main():
     import argparse
     parser = argparse.ArgumentParser(description="NanoAgent Loop")
     parser.add_argument("--resume", type=str, default=None, help="Session ID to resume")
     parser.add_argument("--fork-at", type=int, default=None, help="Step to fork at")
     args = parser.parse_args()
     run(resume_session_id=args.resume, fork_at=args.fork_at)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n[Orchestrator] Interrupted.")
