@@ -1,26 +1,21 @@
 """
 demo/crash_and_recover.py — Integration Test: Crash & Recovery
 
-Demonstrates the full crash-and-recovery cycle using SidecarSession directly.
+Demonstrates two crash-and-recovery scenarios using SidecarSession directly.
 No subprocess stdin piping — the test drives the SDK inline for reliability.
 
-What this test does:
-  Phase 1 — Run session until crash:
-    1. Start Sidecar (subprocess, port 7878)
-    2. Call SidecarSession.start() via the SDK
-    3. Feed the agent a 3-step task (bash_write → bash_run → fetch_url)
-    4. After the first bash_write completes, raise CrashInjected (simulate crash)
-    5. Record the session_id and checkpoint state
+Scenario A — Agent/Sidecar crash (Phases 1–3):
+  1. Start Sidecar subprocess
+  2. Run a 3-step task (bash_write → bash_run → fetch_url)
+  3. Inject CrashInjected after bash_write
+  4. Kill Sidecar, restart fresh (SQLite only — no in-memory shortcut)
+  5. Resume session, assert bash_write NOT re-executed, fetch_url runs fresh
 
-  Phase 2 — Resume from checkpoint:
-    6. Restart a fresh Sidecar and SidecarSession in RESUME mode
-    7. Confirm bash_write is replayed from cache (not re-executed)
-    8. Complete bash_run and fetch_url
-
-  Phase 3 — Assert:
-    9. bash_write → replayed (↺)
-    10. bash_run   → executed (⚡)
-    11. fetch_url  → executed (⚡)
+Scenario B — Sandbox container crash (Phases 4–5):
+  6. New SidecarSession, write a sentinel file into sandbox
+  7. Kill the sandbox object directly (simulates container OOM/eviction)
+  8. Call session.revive_sandbox() — new sandbox spun up, REPLAYABLE events replayed
+  9. Read the sentinel file back — verify it survived the revival
 
 Run:
     python demo/crash_and_recover.py
@@ -140,7 +135,7 @@ async def run_agent_turn(
 
 # ── Phase 1 ────────────────────────────────────────────────────────────────────
 
-async def phase1(sidecar_proc) -> tuple[str, dict]:
+async def phase1() -> tuple[str, dict]:
     """Run until bash_write completes, then inject a crash. Return session_id + tool log."""
     from sidecar.session import SidecarSession
 
@@ -178,7 +173,7 @@ async def phase1(sidecar_proc) -> tuple[str, dict]:
 
 # ── Phase 2 ────────────────────────────────────────────────────────────────────
 
-async def phase2(session_id: str, sidecar_proc) -> dict:
+async def phase2(session_id: str) -> dict:
     """Resume from checkpoint and complete remaining steps."""
     from sidecar.session import SidecarSession
 
@@ -202,7 +197,128 @@ async def phase2(session_id: str, sidecar_proc) -> dict:
     return tool_log
 
 
-# ── Phase 3 ────────────────────────────────────────────────────────────────────
+# ── Phase 4 — Sandbox Crash & Revival ────────────────────────────────────────
+
+def sidecar_post(path: str, body: dict) -> dict:
+    """Synchronous HTTP POST to the Sidecar — same pattern as agent/loop.py."""
+    raw = json.dumps(body).encode()
+    req = urllib.request.Request(
+        f"{SIDECAR_URL}{path}",
+        data=raw,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=180) as r:
+        return json.loads(r.read())
+
+
+def phase4_sandbox_crash() -> dict:
+    """
+    Simulate a sandbox container crash (OOM, eviction, etc.).
+
+    This test uses the Sidecar HTTP API entirely — no SDK imports,
+    no shared process between test runner and Sidecar.
+
+    Steps:
+      1. POST /session/start  → fresh session, new sandbox
+      2. POST /tool/execute   → bash_write sentinel file (logged as REPLAYABLE)
+      3. POST /tool/execute   → bash_read to confirm file exists
+      4. POST /sandbox/kill   → simulate container crash (Sidecar kills sandbox
+                                 but keeps session + effect_log alive)
+      5. POST /session/revive → Sidecar creates new sandbox, replays REPLAYABLE
+                                 events to restore filesystem state
+      6. POST /tool/execute   → bash_read to verify sentinel file survived
+      7. POST /session/end    → clean up
+    """
+    header("PHASE 4: Sandbox container crash + revival (via HTTP)")
+
+    sentinel = "sandbox_revival_ok"
+
+    # 1. Start session
+    start_resp = sidecar_post("/session/start", {})
+    old_sandbox_id = start_resp["sandbox_id"]
+    info(f"Session started: {start_resp['session_id']}")
+    info(f"Original sandbox: {old_sandbox_id}")
+
+    # 2. Write sentinel file (REPLAYABLE — will be in effect_log)
+    write_resp = sidecar_post("/tool/execute", {
+        "tool_name": "bash_write",
+        "tool_input": {"command": f"echo '{sentinel}' > /tmp/sandbox_revival_test.txt"},
+    })
+    info(f"Sentinel written: {write_resp['result']!r}")
+    assert write_resp["effect"] == "Effect.REPLAYABLE", \
+        f"Expected REPLAYABLE, got {write_resp['effect']}"
+
+    # 3. Confirm file is there before crash
+    pre = sidecar_post("/tool/execute", {
+        "tool_name": "bash_read",
+        "tool_input": {"command": "cat /tmp/sandbox_revival_test.txt"},
+    })
+    assert sentinel in pre["result"], f"Sentinel write failed! Got: {pre['result']}"
+    ok("Sentinel file confirmed in sandbox before crash.")
+
+    # 4. Inject sandbox crash via HTTP — Sidecar kills the container but stays alive
+    warn("Injecting sandbox crash via POST /sandbox/kill...")
+    kill_resp = sidecar_post("/sandbox/kill", {})
+    assert kill_resp.get("killed"), f"Sandbox kill failed: {kill_resp}"
+    ok("Sandbox killed (simulated container crash). Sidecar process still alive.")
+
+    # 5. Revive — Sidecar creates new sandbox + replays REPLAYABLE events
+    info("Calling POST /session/revive...")
+    revive_resp = sidecar_post("/session/revive", {})
+    new_sandbox_id = revive_resp["sandbox_id"]
+    replayed = revive_resp["replayed_events"]
+    ok(f"Sandbox revived: {new_sandbox_id} ({replayed} event(s) replayed)")
+
+    # 6. Verify sentinel file survived
+    post = sidecar_post("/tool/execute", {
+        "tool_name": "bash_read",
+        "tool_input": {"command": "cat /tmp/sandbox_revival_test.txt"},
+    })
+    info(f"Post-revival file content: {post['result']!r}")
+
+    # 7. Clean up
+    sidecar_post("/session/end", {})
+
+    return {
+        "old_sandbox_id": old_sandbox_id,
+        "new_sandbox_id": new_sandbox_id,
+        "replayed_events": replayed,
+        "sentinel_content": post["result"],
+        "sentinel_expected": sentinel,
+    }
+
+
+
+def phase5_assert_sandbox(result: dict):
+    header("PHASE 5: Sandbox revival assertions")
+    passed = failed = 0
+
+    def check(label, cond):
+        nonlocal passed, failed
+        if cond:
+            ok(label)
+            passed += 1
+        else:
+            err(label)
+            failed += 1
+
+    check("Sandbox ID changed after revival (new container was created)",
+          result["old_sandbox_id"] != result["new_sandbox_id"])
+
+    check("At least 1 REPLAYABLE event was replayed during revival",
+          result["replayed_events"] >= 1)
+
+    check("Sentinel file content matches after revival (filesystem state restored)",
+          result["sentinel_expected"] in result["sentinel_content"])
+
+    header("RESULTS")
+    print(f"  {c('green', str(passed))} passed   {c('red', str(failed))} failed")
+    if failed > 0:
+        print(c('red', c('bold', "\n💥  Sandbox revival assertions failed.")))
+        sys.exit(1)
+
+
 
 def phase3_assert(phase1_log: dict, phase2_log: dict):
     header("PHASE 3: Assertions")
@@ -221,14 +337,16 @@ def phase3_assert(phase1_log: dict, phase2_log: dict):
     check("Phase 1: bash_write was EXECUTED before crash (⚡)",
           phase1_log.get("bash_write") == "executed")
 
-    # Phase 2: The LLM reads history and skips bash_write since it's already done.
-    # bash_run may be replayed from the in-session cache or freshly executed.
-    # fetch_url (never called before crash) must be freshly executed.
-    check("Phase 2: fetch_url was EXECUTED fresh (not in cache, must be real call ⚡)",
+    # Phase 1: fetch_url must NOT have been called (crash happened before it)
+    check("Phase 1: fetch_url was NOT called before crash",
+          "fetch_url" not in phase1_log)
+
+    # Phase 2: fetch_url (never in cache) must be freshly executed
+    check("Phase 2: fetch_url was EXECUTED fresh after resume (⚡)",
           phase2_log.get("fetch_url") == "executed")
 
-    # Key invariant: crash happened mid-task, not at the very start or very end
-    check("Cross-phase: Task did NOT restart from scratch (fetch_url done in Phase 2, not Phase 1)",
+    # Key invariant: recovery, not restart
+    check("Cross-phase: Task continued from crash point (not restarted from scratch)",
           "fetch_url" not in phase1_log and "fetch_url" in phase2_log)
 
     header("RESULTS")
@@ -255,9 +373,27 @@ async def main():
     ok("Sidecar listening.")
 
     try:
-        session_id, phase1_log = await phase1(sidecar)
-        phase2_log = await phase2(session_id, sidecar)
+        # ── Scenario A: Agent/Sidecar crash ──────────────────────────────────
+        session_id, phase1_log = await phase1()
+
+        info("Killing Sidecar between phases (simulating full process death)...")
+        sidecar.kill()
+        sidecar.wait()
+        ok("Sidecar dead. Restarting fresh Sidecar for Phase 2...")
+        sidecar = start_sidecar()
+        if not wait_for_sidecar(timeout=20):
+            err("Sidecar failed to restart for Phase 2!")
+            sys.exit(1)
+        ok("New Sidecar listening. Phase 2 will recover from SQLite only.")
+
+        phase2_log = await phase2(session_id)
         phase3_assert(phase1_log, phase2_log)
+
+        # ── Scenario B: Sandbox crash ─────────────────────────────────────────
+        sandbox_result = phase4_sandbox_crash()
+        phase5_assert_sandbox(sandbox_result)
+
+        print(c('green', c('bold', "\n🎉  ALL integration tests PASSED!")))
     finally:
         sidecar.kill()
         sidecar.wait()

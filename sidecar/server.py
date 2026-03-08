@@ -75,11 +75,36 @@ def route_llm_generate(body: dict) -> dict:
     )
 
 
+def route_session_revive(body: dict) -> dict:
+    """Kill the current sandbox and revive it, replaying REPLAYABLE events."""
+    if not _session:
+        return {"error": "No active session."}
+    return _run_async(_session.revive_sandbox(), timeout=120)
+
+
+def route_sandbox_kill(body: dict) -> dict:
+    """
+    Forcibly kill the active sandbox without ending the session.
+    Used by integration tests to simulate a container crash.
+    The session_id and effect_log remain intact.
+    """
+    if not _session or not _session._sandbox:
+        return {"error": "No active sandbox."}
+    try:
+        _run_async(_session._sandbox.kill())
+    except Exception:
+        pass
+    _session._sandbox = None
+    return {"killed": True}
+
+
 ROUTES = {
-    "/session/start": route_session_start,
-    "/session/end":   route_session_end,
-    "/tool/execute":  route_tool_execute,
-    "/llm/generate":  route_llm_generate,
+    "/session/start":   route_session_start,
+    "/session/end":     route_session_end,
+    "/session/revive":  route_session_revive,
+    "/sandbox/kill":    route_sandbox_kill,
+    "/tool/execute":    route_tool_execute,
+    "/llm/generate":    route_llm_generate,
 }
 
 
