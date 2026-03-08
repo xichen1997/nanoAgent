@@ -12,10 +12,12 @@
 └──────────────────┬──────────────────────────┘
                    │ HTTP JSON (localhost:7878)
 ┌──────────────────▼──────────────────────────┐
-│  RING 0 — Sidecar (sidecar/)                 │  Subprocess B (or embedded SDK)
+│  RING 0 — Sidecar (sidecar/)                 │  Subprocess B
 │  ├─ SidecarSession  ← core SDK class         │
 │  ├─ Policy Engine (L1 effect · L2 quota)     │
 │  ├─ Effect Log WAL (SQLite, atomic)          │
+│  ├─ Filesystem Snapshots (tar.gz)            │
+│  ├─ Trunk / Fork Registry (parallel tasks)  │
 │  ├─ Semantic Checkpoint (messages + cursor)  │
 │  └─ Capability Gateway (host-side fetch)     │
 └──────────────┬───────────────────┬──────────┘
@@ -44,9 +46,14 @@ The **Tool Registry** (`sidecar/policy.py`) is the single source of truth for ev
 | Tool | Effect | Replay Behavior |
 |---|---|---|
 | `bash_read` | `no_side_effects` | Skip — inject cached result |
-| `bash_write` | `replayable` | Re-execute to reconstruct env |
+| `bash_write` | `replayable_fast` | Re-execute to reconstruct env |
+| `bash_build` | `replayable_expensive` | ⚡ Re-execute **and** take filesystem snapshot afterwards |
 | `bash_run` | `irreversible` | Return cached result, never re-run |
 | `fetch_url` | `irreversible` | Return cached result, never re-call |
+
+**Networking rules:**
+- External internet → `fetch_url` (routes through host Gateway, sandbox is air-gapped)
+- Internal sandbox services (localhost) → `bash_run curl localhost:port` (container-local, no Gateway needed)
 
 ## Project Layout
 
@@ -59,11 +66,12 @@ opensandbox-agent/
 │   ├── session.py      ← Core SDK: SidecarSession (async class)
 │   ├── server.py       ← Thin HTTP wrapper over SidecarSession
 │   ├── policy.py       ← Tool Registry + Policy Engine
-│   ├── effect_log.py   ← SQLite WAL (effect_log + checkpoints tables)
+│   ├── effect_log.py   ← SQLite WAL (all tables: effect_log, checkpoints, snapshots, trunk, forks)
 │   └── gateway.py      ← Host-side URL fetcher
 ├── demo/
-│   └── crash_and_recover.py  ← Integration test: inject crash, resume
-├── AGENT_LOGIC.md      ← Internals: replay, WAL, policy layers
+│   ├── crash_and_recover.py  ← Integration test: agent/sidecar crash + sandbox crash
+│   └── concurrent_tasks.py   ← Integration test: fork / conflict / refork cycle
+├── ARCHITECTURE.md     ← Full system architecture reference
 └── .env
 ```
 
@@ -133,37 +141,46 @@ curl -X POST http://127.0.0.1:7878/tool/execute \
 ## Crash & Recovery Demo
 
 ```bash
+# Agent/Sidecar crash + sandbox container crash
 python demo/crash_and_recover.py
 ```
 
-Runs a 3-step task (bash_write → bash_run → fetch_url), injects a crash after `bash_write`, then resumes from the SQLite checkpoint and verifies:
-- `bash_write` executed before crash ✅
-- `fetch_url` executed fresh after resume (was never called before crash) ✅
-- Task did not restart from scratch ✅
+Runs two scenarios, verifying:
+- `bash_write` replayed correctly after agent crash ✅
+- `fetch_url` never duplicated ✅
+- Sandbox crash recovered via `revive_sandbox()` ✅
+
+## Concurrent Tasks Demo
+
+```bash
+python demo/concurrent_tasks.py
+```
+
+Exercises the trunk-based fork/commit model:
+- Fork A and Fork B spawn from the same trunk ✅
+- Fork A commits first → new trunk ✅
+- Fork B detects conflict, aborts ✅
+- Fork B re-forks from A's trunk, inherits A's files ✅
+- Fork B commits successfully → final trunk ✅
 
 ## Data
 
-Sessions are stored in `sidecar_data/effect_log.db` (SQLite). Two tables:
+Sessions are stored in `sidecar_data/effect_log.db` (SQLite, WAL mode). Six tables:
 
-- **`effect_log`** — every tool call (Intent + Completion) and LLM generation, with idempotency keys
-- **`checkpoints`** — atomic snapshot of LLM message history + effect log cursor, updated after each generation
+| Table | Description |
+|---|---|
+| `sessions` | Session registry |
+| `effect_log` | Every tool call + LLM generation (append-only) |
+| `checkpoints` | LLM message history + effect cursor + snapshot pointer (atomic upsert) |
+| `snapshots` | Filesystem .tar.gz snapshot records for `REPLAYABLE_EXPENSIVE` recovery |
+| `trunk` | Trunk version history (canonical sandbox states for parallel tasks) |
+| `forks` | Fork registry with status (active / committed / conflicted / aborted) |
 
-## Roadmap (v2 Design)
+## Roadmap (v3)
 
-These capabilities are designed but not yet implemented.
+### `/step` — Agent-Agnostic State Machine
 
----
-
-### 1. Agent-Agnostic State Machine
-
-**Current:** `sidecar/session.py` is decoupled from HTTP transport but is still written assuming a single conversation-style agent loop.
-
-**v2:** The Sidecar should become a pure **state machine** — given any sequence of `(intent, result)` pairs, it transitions state and returns the next instruction. It should have zero assumptions about:
-- How the agent is implemented (LangGraph, raw loop, C++ state machine)
-- Whether there is a human in the loop
-- How many agents are talking to it at once
-
-The ideal interface is a single endpoint:
+Move all orchestration into the Sidecar. The Agent becomes a pure executor:
 
 ```
 POST /step
@@ -171,74 +188,8 @@ POST /step
 → { "next_action": { "type": "call_llm" | "execute_tool" | "wait_user" | "done" } }
 ```
 
-The agent becomes a dumb executor that calls `/step` in a loop. All orchestration intelligence lives in Ring 0.
+Any agent implementation (LangGraph, Autogen, raw loop, human-in-the-loop) drives the same Sidecar without changes.
 
 ---
 
-### 2. MicroVM Snapshot Checkpointing
-
-**Current:** `bash_write` steps are re-executed during replay to reconstruct sandbox state. This is fine for fast commands but breaks down for expensive operations (compiling LLVM, pulling GB-scale datasets).
-
-**v2:** After any expensive `bash_write` completes, the Sidecar immediately takes a **physical snapshot** of the sandbox filesystem (e.g. Firecracker ext4 differential snapshot, or copy-on-write via something like Sprites.dev). The checkpoint JSON gains a `sandbox_state` pointer:
-
-```json
-{
-  "step": 12,
-  "llm_history": ["..."],
-  "effect_log_cursor": "uuid-1234",
-  "sandbox_state": {
-    "provider": "firecracker",
-    "snapshot_id": "snap_v12_compiled_lib"
-  }
-}
-```
-
-On crash recovery, instead of replaying `bash_write` commands, the scheduler restores the snapshot in milliseconds — the compiled library is already there.
-
-The policy engine (`sidecar/policy.py`) would gain a new effect tier:
-
-| Effect | Behavior | Snapshot? |
-|---|---|---|
-| `no_side_effects` | Skip on replay | No |
-| `replayable_fast` | Re-execute on replay | No |
-| `replayable_expensive` | Restore from snapshot | **Yes** |
-| `irreversible` | Return cached result | No |
-
----
-
-### 3. Concurrent Tasks — Trunk-based Fork & Patch
-
-**Current:** One session = one agent = one sandbox. Serial execution only.
-
-**v2:** Concurrency is orchestrated in Ring 3 (the agent), while Ring 0 maintains the **single source of truth** using a Git-style trunk model.
-
-```
-Ring 0: Main Trunk  ─────────────────────────────────────────────────►
-                         │                    │
-Ring 3:           Task A (fork)          Task B (fork)
-                  sandbox_a              sandbox_b
-                  runs async             runs async
-                         │                    │
-                  finishes first         still running
-                         │
-                  generates patch ──► Ring 0 applies to trunk
-                                              │
-                                      Task B gets merge conflict
-                                      → killed, re-forked from new trunk
-                                      → re-runs with updated context
-```
-
-**Rules:**
-- Any new sandbox is always forked from the **latest trunk state**
-- Completed tasks never overwrite trunk directly — they submit a **changesets** (git patch / SQL diff) via Intent IR to Ring 0
-- Ring 0 serialises all trunk mutations (no concurrent writes)
-- Conflict resolution is brute-force: kill the stale agent, give it the new trunk context, re-run
-
-This maps naturally to the current design: effect log idempotency keys + WAL already provide the serialisation primitive. What's missing is the fork registry and changesets endpoint.
-
----
-
-See [AGENT_LOGIC.md](AGENT_LOGIC.md) for the current implementation internals.
-
----
 *Built to push the limits of Agent isolation, determinism, and crash-resilience.*
