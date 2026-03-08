@@ -74,12 +74,17 @@ class PolicyEngine:
         return entry["effect"]
 
     @staticmethod
-    def is_replayable(effect: Effect) -> bool:
+    def is_replayable(effect: Effect | str) -> bool:
         """True for any effect tier that replays filesystem writes."""
-        return effect in (
-            Effect.REPLAYABLE_FAST,
-            Effect.REPLAYABLE_EXPENSIVE,
-            Effect.REPLAYABLE,  # legacy rows
+        # effect can be an Enum instance or a string loaded from DB
+        val = effect.value if isinstance(effect, Effect) else str(effect)
+        return val in (
+            Effect.REPLAYABLE_FAST.value,
+            Effect.REPLAYABLE_EXPENSIVE.value,
+            Effect.REPLAYABLE.value,  # legacy rows
+            str(Effect.REPLAYABLE_FAST),
+            str(Effect.REPLAYABLE_EXPENSIVE),
+            str(Effect.REPLAYABLE),
         )
 
     def check(self, tool_name: str, command: str = "") -> Effect:

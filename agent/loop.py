@@ -16,13 +16,13 @@ It simply:
 
 The Sidecar is its entire world.
 """
-import json
 import os
 import sys
-import urllib.request
-import urllib.error
+
+from sidecar.client import SidecarClient
 
 SIDECAR_URL = os.environ.get("SIDECAR_URL", "http://127.0.0.1:7878")
+client = SidecarClient(SIDECAR_URL)
 
 SYSTEM_PROMPT = """You are a helpful AI assistant with access to a secure bash sandbox and a host Capability Gateway.
 
@@ -41,33 +41,9 @@ Networking rules:
 """
 
 
-def sidecar_post(path: str, data: dict) -> dict:
-    body = json.dumps(data, ensure_ascii=False).encode()
-    req = urllib.request.Request(
-        f"{SIDECAR_URL}{path}",
-        data=body,
-        method="POST",
-        headers={"Content-Type": "application/json"},
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=180) as resp:
-            return json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        raw = e.read().decode()
-        raise RuntimeError(f"Sidecar {path} HTTP {e.code}: {raw}")
-    except urllib.error.URLError as e:
-        raise RuntimeError(f"Sidecar unreachable at {SIDECAR_URL}: {e.reason}")
-
-
 def run(resume_session_id: str | None = None, fork_at: int | None = None):
     # ── Start session (creates sandbox, replays if resuming) ─────────────────
-    start_payload = {}
-    if resume_session_id:
-        start_payload["resume_session_id"] = resume_session_id
-        if fork_at is not None:
-            start_payload["fork_at"] = fork_at
-
-    session_info = sidecar_post("/session/start", start_payload)
+    session_info = client.start(resume_session_id=resume_session_id, fork_at=fork_at)
     session_id = session_info["session_id"]
     replay_mode = session_info.get("replay_mode", False)
 
@@ -104,10 +80,7 @@ def run(resume_session_id: str | None = None, fork_at: int | None = None):
 
             # ── Agentic loop: call LLM until we get a text stop ──────────────
             while True:
-                gen = sidecar_post("/llm/generate", {
-                    "messages": messages,
-                    "system": SYSTEM_PROMPT,
-                })
+                gen = client.llm_generate(messages, system=SYSTEM_PROMPT)
 
                 content = gen["content"]
                 stop_reason = gen["stop_reason"]
@@ -125,12 +98,7 @@ def run(resume_session_id: str | None = None, fork_at: int | None = None):
                         tool_name = block["name"]
                         tool_input = block["input"]
 
-                        exec_resp = sidecar_post("/tool/execute", {
-                            "tool_use_id": tool_use_id,
-                            "tool_name": tool_name,
-                            "tool_input": tool_input,
-                            "session_id": session_id,
-                        })
+                        exec_resp = client.execute_tool(tool_name, tool_input, tool_use_id)
 
                         result = exec_resp.get("result", "[No result]")
                         if exec_resp.get("replayed"):
@@ -165,7 +133,7 @@ def run(resume_session_id: str | None = None, fork_at: int | None = None):
 
     finally:
         try:
-            sidecar_post("/session/end", {"session_id": session_id})
+            client.end()
         except Exception:
             pass  # Sidecar may already be gone (e.g. Ctrl+C)
 
@@ -186,3 +154,4 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         print("\n[Orchestrator] Interrupted.")
+

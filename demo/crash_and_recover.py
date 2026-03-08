@@ -199,86 +199,77 @@ async def phase2(session_id: str) -> dict:
 
 # ── Phase 4 — Sandbox Crash & Revival ────────────────────────────────────────
 
-def sidecar_post(path: str, body: dict) -> dict:
-    """Synchronous HTTP POST to the Sidecar — same pattern as agent/loop.py."""
-    raw = json.dumps(body).encode()
-    req = urllib.request.Request(
-        f"{SIDECAR_URL}{path}",
-        data=raw,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=180) as r:
-        return json.loads(r.read())
-
-
 def phase4_sandbox_crash() -> dict:
     """
     Simulate a sandbox container crash (OOM, eviction, etc.).
 
-    This test uses the Sidecar HTTP API entirely — no SDK imports,
-    no shared process between test runner and Sidecar.
+    This test uses the SidecarClient SDK entirely — no shared process
+    between test runner and Sidecar.
 
     Steps:
-      1. POST /session/start  → fresh session, new sandbox
-      2. POST /tool/execute   → bash_write sentinel file (logged as REPLAYABLE)
-      3. POST /tool/execute   → bash_read to confirm file exists
-      4. POST /sandbox/kill   → simulate container crash (Sidecar kills sandbox
-                                 but keeps session + effect_log alive)
-      5. POST /session/revive → Sidecar creates new sandbox, replays REPLAYABLE
-                                 events to restore filesystem state
-      6. POST /tool/execute   → bash_read to verify sentinel file survived
-      7. POST /session/end    → clean up
+      1. client.start()         → fresh session, new sandbox
+      2. client.execute_tool()  → bash_write sentinel file (logged as REPLAYABLE)
+      3. client.execute_tool()  → bash_read to confirm file exists
+      4. POST /sandbox/kill     → simulate container crash (Sidecar kills sandbox
+                                  but keeps session + effect_log alive)
+      5. client.revive_sandbox()→ Sidecar creates new sandbox, replays REPLAYABLE
+                                  events to restore filesystem state
+      6. client.execute_tool()  → bash_read to verify sentinel file survived
+      7. client.end()           → clean up
     """
-    header("PHASE 4: Sandbox container crash + revival (via HTTP)")
+    from sidecar.client import SidecarClient
+    
+    header("PHASE 4: Sandbox container crash + revival (via HTTP SDK)")
 
+    client = SidecarClient(SIDECAR_URL)
     sentinel = "sandbox_revival_ok"
 
     # 1. Start session
-    start_resp = sidecar_post("/session/start", {})
+    start_resp = client.start()
     old_sandbox_id = start_resp["sandbox_id"]
     info(f"Session started: {start_resp['session_id']}")
     info(f"Original sandbox: {old_sandbox_id}")
 
     # 2. Write sentinel file (REPLAYABLE — will be in effect_log)
-    write_resp = sidecar_post("/tool/execute", {
-        "tool_name": "bash_write",
-        "tool_input": {"command": f"echo '{sentinel}' > /tmp/sandbox_revival_test.txt"},
-    })
+    write_resp = client.execute_tool(
+        "bash_write",
+        {"command": f"echo '{sentinel}' > /tmp/sandbox_revival_test.txt"}
+    )
     info(f"Sentinel written: {write_resp['result']!r}")
-    assert write_resp["effect"] == "Effect.REPLAYABLE", \
-        f"Expected REPLAYABLE, got {write_resp['effect']}"
+    assert write_resp["effect"] in ("Effect.REPLAYABLE", "Effect.REPLAYABLE_FAST"), \
+        f"Expected REPLAYABLE fast log, got {write_resp['effect']}"
 
     # 3. Confirm file is there before crash
-    pre = sidecar_post("/tool/execute", {
-        "tool_name": "bash_read",
-        "tool_input": {"command": "cat /tmp/sandbox_revival_test.txt"},
-    })
+    pre = client.execute_tool(
+        "bash_read",
+        {"command": "cat /tmp/sandbox_revival_test.txt"}
+    )
     assert sentinel in pre["result"], f"Sentinel write failed! Got: {pre['result']}"
     ok("Sentinel file confirmed in sandbox before crash.")
 
     # 4. Inject sandbox crash via HTTP — Sidecar kills the container but stays alive
     warn("Injecting sandbox crash via POST /sandbox/kill...")
-    kill_resp = sidecar_post("/sandbox/kill", {})
+    # Directly call the internal _post method for the test-only /sandbox/kill route
+    kill_resp = client._post("/sandbox/kill", {})
     assert kill_resp.get("killed"), f"Sandbox kill failed: {kill_resp}"
     ok("Sandbox killed (simulated container crash). Sidecar process still alive.")
 
     # 5. Revive — Sidecar creates new sandbox + replays REPLAYABLE events
-    info("Calling POST /session/revive...")
-    revive_resp = sidecar_post("/session/revive", {})
+    info("Calling client.revive_sandbox()...")
+    revive_resp = client.revive_sandbox()
     new_sandbox_id = revive_resp["sandbox_id"]
     replayed = revive_resp["replayed_events"]
     ok(f"Sandbox revived: {new_sandbox_id} ({replayed} event(s) replayed)")
 
     # 6. Verify sentinel file survived
-    post = sidecar_post("/tool/execute", {
-        "tool_name": "bash_read",
-        "tool_input": {"command": "cat /tmp/sandbox_revival_test.txt"},
-    })
+    post = client.execute_tool(
+        "bash_read",
+        {"command": "cat /tmp/sandbox_revival_test.txt"}
+    )
     info(f"Post-revival file content: {post['result']!r}")
 
     # 7. Clean up
-    sidecar_post("/session/end", {})
+    client.end()
 
     return {
         "old_sandbox_id": old_sandbox_id,
