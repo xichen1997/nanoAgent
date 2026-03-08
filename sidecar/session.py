@@ -138,6 +138,43 @@ class SidecarSession:
             self._sandbox = None
         return {"ok": True}
 
+    async def revive_sandbox(self) -> dict:
+        """
+        Sandbox crash recovery: kill the dead sandbox, spin up a fresh one,
+        and replay all REPLAYABLE events from the effect log to restore
+        the filesystem to where it was before the crash.
+
+        Call this when a tool call raises an exception that indicates the
+        sandbox container is gone (ConnectionError, RuntimeError from SDK, etc).
+        Returns a dict with the new sandbox_id and the number of events replayed.
+        """
+        self._log("[SANDBOX CRASH] Starting sandbox revival...")
+
+        # 1. Kill the dead sandbox (best-effort)
+        if self._sandbox:
+            try:
+                await self._sandbox.kill()
+            except Exception:
+                pass
+            self._sandbox = None
+
+        # 2. Create a fresh sandbox
+        self._sandbox = await self._create_sandbox()
+        self._log(f"[SANDBOX CRASH] New sandbox: {self._sandbox.id}")
+
+        # 3. Replay REPLAYABLE events from this session's effect log
+        from sidecar.effect_log import get_effect_log_from
+        all_events = get_effect_log_from(self._session_id, from_step=0)
+        replayed = 0
+        for event in all_events:
+            if event["effect"] == str(Effect.REPLAYABLE):
+                self._log(f"[SANDBOX CRASH] Replaying: {event['command'][:60]}")
+                await self._run_bash(event["command"])
+                replayed += 1
+
+        self._log(f"[SANDBOX CRASH] Revival complete. {replayed} events replayed.")
+        return {"sandbox_id": self._sandbox.id, "replayed_events": replayed}
+
     # ── Core SDK Methods ──────────────────────────────────────────────────────
 
     async def execute_tool(
