@@ -98,13 +98,90 @@ def route_sandbox_kill(body: dict) -> dict:
     return {"killed": True}
 
 
-ROUTES = {
+# ── Snapshot Routes ────────────────────────────────────────────────────────────
+
+def route_snapshot_take(body: dict) -> dict:
+    """Manually trigger a filesystem snapshot of the current sandbox."""
+    if not _session:
+        return {"error": "No active session."}
+    from sidecar.effect_log import get_last_llm_step
+    step = get_last_llm_step(_session.session_id) or 0
+    snap_id = _run_async(_session._take_snapshot(step), timeout=120)
+    return {"snapshot_id": snap_id}
+
+
+def route_snapshot_list(body: dict) -> dict:
+    """List all snapshots for the current session."""
+    if not _session:
+        return {"error": "No active session."}
+    from sidecar.effect_log import list_snapshots
+    snaps = list_snapshots(_session.session_id)
+    return {"snapshots": snaps}
+
+
+# ── Trunk Routes ───────────────────────────────────────────────────────────────
+
+def route_trunk_init(body: dict) -> dict:
+    """Create the initial trunk from the current sandbox state."""
+    if not _session:
+        return {"error": "No active session."}
+    return _run_async(_session.init_trunk(), timeout=120)
+
+
+def route_trunk_fork(body: dict) -> dict:
+    """Fork a new session from the latest (or specified) trunk version."""
+    global _session
+    from sidecar.session import SidecarSession
+    _session = SidecarSession(debug=True)
+    return _run_async(
+        _session.fork_from_trunk(trunk_id=body.get("trunk_id")),
+        timeout=120,
+    )
+
+
+def route_trunk_commit(body: dict) -> dict:
+    """Commit this fork's changes to the trunk."""
+    if not _session:
+        return {"error": "No active session."}
+    return _run_async(_session.commit_to_trunk(), timeout=300)
+
+
+def route_trunk_abort(body: dict) -> dict:
+    """Abort this fork (kill sandbox, mark as aborted)."""
+    if not _session:
+        return {"error": "No active session."}
+    return _run_async(_session.abort_fork())
+
+
+def route_trunk_status(body: dict) -> dict:
+    """Return current trunk version and active forks."""
+    if not _session:
+        from sidecar.effect_log import get_latest_trunk, list_active_forks
+        trunk = get_latest_trunk()
+        if not trunk:
+            return {"trunk": None, "active_forks": []}
+        return {"trunk_id": trunk["trunk_id"], "active_forks": []}
+    return _session.trunk_status()
+
+
+POST_ROUTES = {
     "/session/start":   route_session_start,
     "/session/end":     route_session_end,
     "/session/revive":  route_session_revive,
     "/sandbox/kill":    route_sandbox_kill,
     "/tool/execute":    route_tool_execute,
     "/llm/generate":    route_llm_generate,
+    "/snapshot/take":   route_snapshot_take,
+    "/trunk/init":      route_trunk_init,
+    "/trunk/fork":      route_trunk_fork,
+    "/trunk/commit":    route_trunk_commit,
+    "/trunk/abort":     route_trunk_abort,
+    "/trunk/status":    route_trunk_status,
+}
+
+GET_ROUTES = {
+    "/snapshot/list":   route_snapshot_list,
+    "/trunk/status":    route_trunk_status,
 }
 
 
@@ -129,11 +206,16 @@ class SidecarHandler(BaseHTTPRequestHandler):
                 "session": _session.session_id if _session else None,
                 "replay": _session.is_replay if _session else False,
             })
+        elif self.path in GET_ROUTES:
+            try:
+                self._send_json(GET_ROUTES[self.path]({}))
+            except Exception as e:
+                self._send_json({"error": str(e)}, 500)
         else:
             self._send_json({"error": "Not found"}, 404)
 
     def do_POST(self):
-        handler = ROUTES.get(self.path)
+        handler = POST_ROUTES.get(self.path)
         if not handler:
             self._send_json({"error": f"Unknown route: {self.path}"}, 404)
             return

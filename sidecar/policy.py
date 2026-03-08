@@ -8,9 +8,13 @@ from enum import Enum
 
 
 class Effect(str, Enum):
-    NO_SIDE_EFFECTS = "no_side_effects"   # Safe to skip on replay (pure read)
-    REPLAYABLE      = "replayable"        # Safe to re-execute on replay (reconstruct env)
-    IRREVERSIBLE    = "irreversible"      # Must NEVER execute twice; use cached result
+    NO_SIDE_EFFECTS      = "no_side_effects"   # Safe to skip on replay (pure read)
+    REPLAYABLE_FAST      = "replayable_fast"   # Re-execute on replay (fast commands)
+    REPLAYABLE_EXPENSIVE = "replayable_expensive"  # Re-execute + snapshot afterwards
+    IRREVERSIBLE         = "irreversible"      # Must NEVER execute twice; use cached result
+
+    # Backwards-compat alias used in existing effect_log rows
+    REPLAYABLE = "replayable"  # treat as replayable_fast on read
 
 
 # ── Tool Registry ──────────────────────────────────────────────────────────────
@@ -26,16 +30,20 @@ TOOL_REGISTRY: dict[str, dict] = {
         "description": "[SAFE TO SKIP] Read-only bash command (cat, ls, find, echo).",
     },
     "bash_write": {
-        "effect": Effect.REPLAYABLE,
-        "description": "[SAFE TO REPLAY] Bash command that modifies sandbox state (mkdir, write file, apt install).",
+        "effect": Effect.REPLAYABLE_FAST,
+        "description": "[SAFE TO REPLAY] Quick bash command that modifies sandbox state (mkdir, write file, small installs).",
+    },
+    "bash_build": {
+        "effect": Effect.REPLAYABLE_EXPENSIVE,
+        "description": "[SAFE TO REPLAY, EXPENSIVE] Expensive bash command that modifies sandbox state and triggers a filesystem snapshot for fast recovery (compiling, pip install torch, apt install build-essential, pulling large datasets). Use this instead of bash_write for long-running setup commands.",
     },
     "bash_run": {
         "effect": Effect.IRREVERSIBLE,
-        "description": "[NEVER REPLAY] Bash command with external side effects (e.g. posting to API, dropping DB).",
+        "description": "[NEVER REPLAY] Bash command with external side effects (e.g. posting to API, dropping DB, running a server, calling an internal localhost service).",
     },
     "fetch_url": {
         "effect": Effect.IRREVERSIBLE,
-        "description": "[NEVER REPLAY] Fetch a URL via the host Gateway (GET or POST calls to external APIs).",
+        "description": "[NEVER REPLAY] Fetch an EXTERNAL URL via the host Gateway (GET or POST to public APIs). Do NOT use for localhost — use bash_run curl instead.",
     },
 }
 
@@ -64,6 +72,15 @@ class PolicyEngine:
         if not entry:
             raise PolicyViolation(f"Unknown tool: '{tool_name}'. Not in TOOL_REGISTRY.")
         return entry["effect"]
+
+    @staticmethod
+    def is_replayable(effect: Effect) -> bool:
+        """True for any effect tier that replays filesystem writes."""
+        return effect in (
+            Effect.REPLAYABLE_FAST,
+            Effect.REPLAYABLE_EXPENSIVE,
+            Effect.REPLAYABLE,  # legacy rows
+        )
 
     def check(self, tool_name: str, command: str = "") -> Effect:
         """
@@ -115,7 +132,7 @@ def build_llm_tool_schema() -> list[dict]:
         }
     }
     
-    bash_tools = ["bash_read", "bash_write", "bash_run"]
+    bash_tools = ["bash_read", "bash_write", "bash_build", "bash_run"]
     for name in bash_tools:
         schemas.append({
             "name": name,
