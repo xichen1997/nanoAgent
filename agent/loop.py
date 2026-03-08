@@ -29,9 +29,15 @@ SYSTEM_PROMPT = """You are a helpful AI assistant with access to a secure bash s
 You have three bash tools:
 - bash_read: for pure read-only commands (cat, ls, find, echo)
 - bash_write: for commands that create or modify files and install packages (mkdir, pip install, writing scripts)
-- bash_run: for any other commands that may have external side effects
+- bash_run: for executing scripts or commands with side effects (running servers, calling subprocess, etc.)
 
-For any HTTP/web requests, you MUST use fetch_url. Never use curl or wget inside the sandbox.
+Networking rules:
+- For EXTERNAL internet calls (public APIs, https:// URLs, anything outside the sandbox):
+  use fetch_url — it routes through the host-side Gateway which has real network access.
+- For INTERNAL services running INSIDE the sandbox (localhost, 127.0.0.1, container-local ports):
+  use bash_run with curl — these are container-local and do NOT need the Gateway.
+  Example: bash_run "curl http://localhost:8080/api/health"
+- Never use curl or wget to reach the external internet directly from bash — the sandbox is air-gapped.
 """
 
 
